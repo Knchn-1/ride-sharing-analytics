@@ -1,21 +1,62 @@
+"""
+stream_processor.py
+====================
+Real-Time Ride-Sharing Analytics — PySpark Structured Streaming Pipeline
+
+Streams:
+    1. ride_events       — raw ride requests
+    2. driver_events     — raw driver location updates
+    3. surge_pricing     — 2-minute tumbling window demand-based pricing
+    4. driver_zones      — grid-based zone demand ranking
+
+Storage:
+    - PostgreSQL         — fact/dimension tables (star schema)
+    - Parquet            — partitioned data lake (year/month/day)
+    - Dead Letter Queue  — invalid/failed records → Kafka topic
+
+Author: Kanchan
+"""
+
+import os
+import time
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, from_json, window, count, round as spark_round,
-    when, concat_ws, floor, lit, desc
+    when, concat_ws, floor, lit, desc, year, month, dayofmonth,
+    hour, to_timestamp, current_timestamp
 )
 from pyspark.sql.types import (
     StructType, StructField, IntegerType,
     DoubleType, StringType, TimestampType
 )
-import os
-from dotenv import load_dotenv
 
-# This will load the variables from your .env file into os.environ
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),                          # console
+        logging.FileHandler("logs/stream_processor.log") # file
+    ]
+)
+logger = logging.getLogger("RideStreamingAnalytics")
+
+# Create logs directory if not exists
+os.makedirs("logs", exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — loaded from .env file, never hardcoded
+# ══════════════════════════════════════════════════════════════════════════════
+
 load_dotenv()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIG  — change only these values
-# ══════════════════════════════════════════════════════════════════════════════
 
 PG_HOST     = os.getenv("PG_HOST", "localhost")
 PG_PORT     = os.getenv("PG_PORT", "5432")
@@ -23,18 +64,18 @@ PG_DATABASE = os.getenv("PG_DATABASE", "ride_analytics")
 PG_USER     = os.getenv("PG_USER", "postgres")
 PG_PASSWORD = os.getenv("PG_PASSWORD")
 
-
 PARQUET_OUTPUT = "D:/Data_eng_Projects/ride-sharing-analytics/data/output"
-
-# Path to the manually downloaded PostgreSQL JDBC jar
-# After running the download command, the jar will be in your project root
-PG_JAR = "file:///D:/Data_eng_Projects/ride-sharing-analytics/postgresql-42.6.0.jar"
+PG_JAR         = "file:///D:/Data_eng_Projects/ride-sharing-analytics/postgresql-42.6.0.jar"
+KAFKA_SERVERS  = "localhost:9092"
+GRID_SIZE      = 0.02   # ~2km grid cells
 
 PG_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
 PG_PROPS = {
-    "user":     PG_USER,
-    "password": PG_PASSWORD,
-    "driver":   "org.postgresql.Driver"
+    "user":           PG_USER,
+    "password":       PG_PASSWORD,
+    "driver":         "org.postgresql.Driver",
+    "batchsize":      "1000",      # ← connection pooling: batch inserts
+    "numPartitions":  "4",         # ← connection pooling: parallel writes
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -48,9 +89,11 @@ spark = SparkSession.builder \
             "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1") \
     .config("spark.jars", PG_JAR) \
     .config("spark.sql.shuffle.partitions", "4") \
+    .config("spark.sql.streaming.metricsEnabled", "true") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("ERROR")
+logger.info("✅ Spark session started successfully")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEMAS
@@ -73,49 +116,155 @@ driver_schema = StructType([
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER — write each micro-batch to PostgreSQL + Parquet
+# DATA QUALITY VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_ride(df):
+    """
+    Validate ride events for data quality.
+
+    Rules:
+        - ride_id must not be null
+        - pickup_lat must be between 21.0 and 21.3 (Nagpur bounds)
+        - pickup_long must be between 78.9 and 79.2 (Nagpur bounds)
+        - user_id must not be null
+
+    Returns:
+        valid_df:   DataFrame with records passing all checks
+        invalid_df: DataFrame with records failing any check (→ DLQ)
+    """
+    valid_df = df.filter(
+        col("ride_id").isNotNull() &
+        col("user_id").isNotNull() &
+        col("pickup_lat").between(21.0, 21.3) &
+        col("pickup_long").between(78.9, 79.2)
+    )
+    invalid_df = df.subtract(valid_df)
+    return valid_df, invalid_df
+
+def validate_driver(df):
+    """
+    Validate driver location events for data quality.
+
+    Rules:
+        - driver_id must not be null
+        - status must be one of: available, on_trip, offline
+        - coordinates must be within Nagpur bounds
+
+    Returns:
+        valid_df:   DataFrame with records passing all checks
+        invalid_df: DataFrame with records failing any check (→ DLQ)
+    """
+    valid_df = df.filter(
+        col("driver_id").isNotNull() &
+        col("status").isin("available", "on_trip", "offline") &
+        col("driver_lat").between(21.0, 21.3) &
+        col("driver_long").between(78.9, 79.2)
+    )
+    invalid_df = df.subtract(valid_df)
+    return valid_df, invalid_df
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STORAGE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_to_postgres(df, epoch_id, table_name):
-    """Write each streaming micro-batch to a PostgreSQL table with robust property handling."""
+    """
+    Write a Spark streaming micro-batch to a PostgreSQL table.
+
+    Uses batch insert with connection pooling for performance.
+    Logs row count and elapsed time per batch.
+
+    Args:
+        df:         Spark DataFrame containing the micro-batch data
+        epoch_id:   Unique batch identifier (used for idempotency logging)
+        table_name: Target PostgreSQL table name
+    """
     try:
-        # Create a clean property dictionary, ensuring no None values exist
-        # We explicitly cast values to string to satisfy Java's Properties class
-        safe_props = {
-            "user": str(PG_USER),
-            "password": str(PG_PASSWORD),
-            "driver": "org.postgresql.Driver"
-        }
-        
-        row_count = df.count()
+        start_time = time.time()
+        row_count  = df.count()
         if row_count > 0:
             df.write \
-              .jdbc(url=PG_URL, table=table_name, mode="append", properties=safe_props)
-            print(f"  ✅ [{table_name}] wrote {row_count} rows to PostgreSQL")
+              .jdbc(url=PG_URL, table=table_name,
+                    mode="append", properties=PG_PROPS)
+            elapsed = round((time.time() - start_time) * 1000, 2)
+            logger.info(f"✅ [{table_name}] epoch={epoch_id} | "
+                        f"rows={row_count} | time={elapsed}ms")
     except Exception as e:
-        print(f"  ❌ [{table_name}] PostgreSQL write failed: {e}")
+        logger.error(f"❌ [{table_name}] epoch={epoch_id} | "
+                     f"PostgreSQL write failed: {e}")
 
 def write_to_parquet(df, epoch_id, path):
-    """Write each streaming micro-batch to partitioned Parquet files."""
+    """
+    Write a Spark streaming micro-batch to partitioned Parquet files.
+
+    Partitions data by year/month/day for efficient querying.
+    Example path: data/output/rides/year=2026/month=3/day=11/
+
+    Args:
+        df:       Spark DataFrame containing the micro-batch data
+        epoch_id: Unique batch identifier
+        path:     Base output path for Parquet files
+    """
     try:
         if df.count() > 0:
-            df.write \
+            df.withColumn("year",  year(current_timestamp())) \
+              .withColumn("month", month(current_timestamp())) \
+              .withColumn("day",   dayofmonth(current_timestamp())) \
+              .write \
               .mode("append") \
+              .partitionBy("year", "month", "day") \
               .parquet(path)
+            logger.info(f"✅ [parquet] epoch={epoch_id} | written to {path}")
     except Exception as e:
-        print(f"  ❌ Parquet write failed at {path}: {e}")
+        logger.error(f"❌ [parquet] epoch={epoch_id} | write failed: {e}")
+
+def write_to_dlq(df, epoch_id, source):
+    """
+    Write invalid records to the Dead Letter Queue (DLQ) PostgreSQL table.
+
+    Records that fail data quality validation are stored here
+    for investigation and reprocessing.
+
+    Args:
+        df:       Spark DataFrame containing invalid records
+        epoch_id: Unique batch identifier
+        source:   Source stream name (e.g. 'ride_events', 'driver_events')
+    """
+    try:
+        row_count = df.count()
+        if row_count > 0:
+            df.withColumn("source",     lit(source)) \
+              .withColumn("failed_at",  lit(str(datetime.now()))) \
+              .withColumn("epoch_id",   lit(epoch_id)) \
+              .write \
+              .jdbc(url=PG_URL, table="dead_letter_queue",
+                    mode="append", properties=PG_PROPS)
+            logger.warning(f"⚠️  [DLQ] {row_count} invalid records from "
+                           f"{source} | epoch={epoch_id}")
+    except Exception as e:
+        logger.error(f"❌ [DLQ] Failed to write to dead letter queue: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # READ FROM KAFKA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def read_topic(topic):
+    """
+    Read a Kafka topic as a Spark structured stream.
+
+    Args:
+        topic: Kafka topic name to subscribe to
+
+    Returns:
+        Spark streaming DataFrame with 'value' column as STRING
+    """
     return (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", "localhost:9092")
+        .option("kafka.bootstrap.servers", KAFKA_SERVERS)
         .option("subscribe", topic)
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", "latest")
         .load()
         .selectExpr("CAST(value AS STRING) as value")
     )
@@ -139,12 +288,12 @@ driver_df = (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAM 1 — RAW RIDE EVENTS → Console + PostgreSQL + Parquet
+# STREAM 1 — RIDE EVENTS → Validate → DLQ + PostgreSQL + Parquet
+# Star Schema: fact_rides
 # ══════════════════════════════════════════════════════════════════════════════
 
 ride_out = ride_df.drop("event_time")
 
-# Console
 ride_console = (
     ride_out.writeStream
     .format("console")
@@ -155,10 +304,12 @@ ride_console = (
     .start()
 )
 
-# PostgreSQL + Parquet via foreachBatch
 def process_rides(df, epoch_id):
-    write_to_postgres(df, epoch_id, "ride_events")
-    write_to_parquet(df, epoch_id, f"{PARQUET_OUTPUT}/rides")
+    """Process ride events — validate, write valid to storage, invalid to DLQ."""
+    valid_df, invalid_df = validate_ride(df)
+    write_to_postgres(valid_df, epoch_id, "fact_rides")
+    write_to_parquet(valid_df, epoch_id, f"{PARQUET_OUTPUT}/fact_rides")
+    write_to_dlq(invalid_df, epoch_id, "ride_events")
 
 ride_sink = (
     ride_out.writeStream
@@ -170,12 +321,12 @@ ride_sink = (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAM 2 — RAW DRIVER EVENTS → Console + PostgreSQL + Parquet
+# STREAM 2 — DRIVER EVENTS → Validate → DLQ + PostgreSQL + Parquet
+# Star Schema: fact_driver_locations
 # ══════════════════════════════════════════════════════════════════════════════
 
 driver_out = driver_df.drop("event_time")
 
-# Console
 driver_console = (
     driver_out.writeStream
     .format("console")
@@ -186,10 +337,12 @@ driver_console = (
     .start()
 )
 
-# PostgreSQL + Parquet via foreachBatch
 def process_drivers(df, epoch_id):
-    write_to_postgres(df, epoch_id, "driver_events")
-    write_to_parquet(df, epoch_id, f"{PARQUET_OUTPUT}/drivers")
+    """Process driver events — validate, write valid to storage, invalid to DLQ."""
+    valid_df, invalid_df = validate_driver(df)
+    write_to_postgres(valid_df, epoch_id, "fact_driver_locations")
+    write_to_parquet(valid_df, epoch_id, f"{PARQUET_OUTPUT}/fact_driver_locations")
+    write_to_dlq(invalid_df, epoch_id, "driver_events")
 
 driver_sink = (
     driver_out.writeStream
@@ -201,7 +354,8 @@ driver_sink = (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAM 3 — SURGE PRICING → Console + PostgreSQL + Parquet
+# STREAM 3 — SURGE PRICING → PostgreSQL + Parquet
+# Star Schema: fact_surge_pricing
 # ══════════════════════════════════════════════════════════════════════════════
 
 surge_df = (
@@ -232,7 +386,6 @@ surge_df = (
     )
 )
 
-# Console
 surge_console = (
     surge_df.writeStream
     .format("console")
@@ -244,10 +397,10 @@ surge_console = (
     .start()
 )
 
-# PostgreSQL + Parquet via foreachBatch
 def process_surge(df, epoch_id):
-    write_to_postgres(df, epoch_id, "surge_pricing")
-    write_to_parquet(df, epoch_id, f"{PARQUET_OUTPUT}/surge")
+    """Process surge pricing windows — write to PostgreSQL and Parquet."""
+    write_to_postgres(df, epoch_id, "fact_surge_pricing")
+    write_to_parquet(df, epoch_id, f"{PARQUET_OUTPUT}/fact_surge_pricing")
 
 surge_sink = (
     surge_df.writeStream
@@ -260,10 +413,9 @@ surge_sink = (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAM 4 — DRIVER ZONES → Console + PostgreSQL + Parquet
+# STREAM 4 — DRIVER ZONES → PostgreSQL + Parquet
+# Star Schema: fact_zone_demand + dim_zones
 # ══════════════════════════════════════════════════════════════════════════════
-
-GRID_SIZE = 0.02
 
 zone_df = (
     ride_df
@@ -278,7 +430,7 @@ zone_df = (
     )
     .withColumn(
         "zone_center_lat",
-        spark_round(col("lat_cell")  * lit(GRID_SIZE) + lit(GRID_SIZE / 2), 4)
+        spark_round(col("lat_cell") * lit(GRID_SIZE) + lit(GRID_SIZE / 2), 4)
     )
     .withColumn(
         "zone_center_long",
@@ -295,7 +447,6 @@ zone_df = (
     .orderBy(desc("ride_demand"))
 )
 
-# Console
 zone_console = (
     zone_df.writeStream
     .format("console")
@@ -307,10 +458,10 @@ zone_console = (
     .start()
 )
 
-# PostgreSQL + Parquet via foreachBatch
 def process_zones(df, epoch_id):
-    write_to_postgres(df, epoch_id, "driver_zones")
-    write_to_parquet(df, epoch_id, f"{PARQUET_OUTPUT}/zones")
+    """Process driver zone demand — write to PostgreSQL and Parquet."""
+    write_to_postgres(df, epoch_id, "fact_zone_demand")
+    write_to_parquet(df, epoch_id, f"{PARQUET_OUTPUT}/fact_zone_demand")
 
 zone_sink = (
     zone_df.writeStream
@@ -326,12 +477,13 @@ zone_sink = (
 # KEEP ALL STREAMS ALIVE
 # ══════════════════════════════════════════════════════════════════════════════
 
-print("\n" + "=" * 65)
-print("  8 ACTIVE STREAMS (4 console + 4 sinks):")
-print("  [1] ride_events    → console + PostgreSQL + Parquet")
-print("  [2] driver_events  → console + PostgreSQL + Parquet")
-print("  [3] surge_pricing  → console + PostgreSQL + Parquet")
-print("  [4] driver_zones   → console + PostgreSQL + Parquet")
-print("=" * 65 + "\n")
+logger.info("=" * 65)
+logger.info("  8 ACTIVE STREAMS (4 console + 4 sinks):")
+logger.info("  [1] fact_rides              → DLQ + PostgreSQL + Parquet")
+logger.info("  [2] fact_driver_locations   → DLQ + PostgreSQL + Parquet")
+logger.info("  [3] fact_surge_pricing      → PostgreSQL + Parquet")
+logger.info("  [4] fact_zone_demand        → PostgreSQL + Parquet")
+logger.info("  Spark UI: http://localhost:4040")
+logger.info("=" * 65)
 
 spark.streams.awaitAnyTermination()
